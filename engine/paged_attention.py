@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import time
 import math
-from dataclasses import dataclass, field
 
 import torch
 from transformers import GPT2LMHeadModel, GPT2Tokenizer

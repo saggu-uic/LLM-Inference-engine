@@ -81,9 +81,7 @@ def bench_batching() -> list[BenchmarkResult]:
     results = []
 
     static_eng = StaticBatchingEngine()
-    t0 = time.perf_counter()
     static_out = static_eng.run(BATCH_PROMPTS, BATCH_MAX_TOKENS, batch_size=4)
-    time.perf_counter() - t0
     results.append(BenchmarkResult(
         "Static batching (B=4)", 0, static_out["throughput_tps"],
         static_out["total_time_s"] * 1000, mem_mb(),
