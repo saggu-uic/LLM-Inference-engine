@@ -14,35 +14,77 @@ from the target alone:
   If all k are accepted, sample a bonus token from the target's distribution.
 
 Expected tokens per target call = 1 + k * α  (where α = mean accept rate)
-Speedup vs target-only ≈ (1 + k*α) / (1 + k * cost_draft/cost_target)
 
 Models
 -------
   draft  = gpt2        (117 M params)
   target = gpt2-medium (345 M params)
 
-KV cache management (O(1) per step — the key efficiency fix)
---------------------------------------------------------------
+KV cache management (O(1) per step)
+-------------------------------------
 Naive implementations re-prefill the draft model on the FULL sequence after
-each acceptance step, costing O(n) draft forwards per step.
+each acceptance step — O(n) forwards per step that grows without bound.
 
 This implementation instead:
-  1. _draft_k saves the intermediate KV state after each draft token (kv_states[i]
-     = draft KV after seeing i draft tokens on top of the current context).
-  2. After accepting n_acc draft tokens, we index kv_states[n_acc] to recover the
-     KV at exactly the right prefix — no re-prefill needed.
-  3. We run the draft model once on the resampled/bonus token to advance its KV.
-  4. For the target, we trim the KV returned by _verify (which covers all k draft
-     tokens) down to n_acc and then run target on the last token only.
+  1. _draft_k saves a KV snapshot before each draft token (kv_states[i] =
+     KV after seeing i draft tokens on top of the current context).
+  2. After accepting n_acc draft tokens, we index kv_states[n_acc] to recover
+     the right prefix — no re-prefill needed.
+  3. We run the draft/target each once on the resampled/bonus token.
 
-Result: each speculative step costs exactly (k+1) draft calls + 2 target calls,
-regardless of how long the sequence has grown.
+NOTE on transformers >= 4.36:
+  Models may return past_key_values as a DynamicCache object rather than a
+  plain tuple-of-tuples. DynamicCache is mutable — the same object is updated
+  in place on each model call — so saving it directly into kv_states would
+  corrupt earlier snapshots. We therefore call _to_tuple() immediately after
+  every model call to convert to an immutable tuple-of-(key,value) snapshot.
 """
 import time
 import torch
 import torch.nn.functional as F
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
+
+# ---------------------------------------------------------------------------
+# KV cache format utilities
+# ---------------------------------------------------------------------------
+
+def _to_tuple(past_kv):
+    """
+    Normalize past_key_values to an immutable tuple-of-(key, value) per layer.
+
+    Handles both:
+      - Legacy format: tuple of (key, value) pairs (one per layer)
+      - DynamicCache  (transformers >= 4.36): has .key_cache / .value_cache lists
+        that are mutated in-place across calls — we snapshot them here.
+    """
+    if past_kv is None:
+        return None
+    if hasattr(past_kv, "key_cache") and hasattr(past_kv, "value_cache"):
+        # DynamicCache: zip the per-layer key/value lists into 2-tuples.
+        # Each k/v tensor is created fresh by torch.cat inside DynamicCache.update(),
+        # so the snapshot is safe even after subsequent model calls.
+        return tuple(zip(past_kv.key_cache, past_kv.value_cache))
+    # Already a tuple of tuples — return as-is (no mutation risk).
+    return tuple(past_kv)
+
+
+def _trim_kv(past_kv, length: int):
+    """
+    Trim past_key_values so only the first `length` positions are retained.
+
+    `past_kv` must be in the normalized tuple-of-(key,value) format
+    produced by _to_tuple().
+    """
+    return tuple(
+        (k[:, :, :length, :], v[:, :, :length, :])
+        for k, v in past_kv
+    )
+
+
+# ---------------------------------------------------------------------------
+# Engine
+# ---------------------------------------------------------------------------
 
 class SpeculativeEngine:
     def __init__(
@@ -70,9 +112,9 @@ class SpeculativeEngine:
 
     @torch.no_grad()
     def _prefill(self, model, ids):
-        """Return (past_kv, last_logits) for the given token sequence."""
+        """Return (past_kv_tuple, last_logits) for the given token sequence."""
         out = model(ids, use_cache=True)
-        return out.past_key_values, out.logits[:, -1, :]
+        return _to_tuple(out.past_key_values), out.logits[:, -1, :]
 
     @torch.no_grad()
     def _draft_k(self, k: int, draft_kv, draft_logits):
@@ -82,14 +124,13 @@ class SpeculativeEngine:
         Returns:
           tokens      : list of k (1,1) token tensors
           probs       : list of k (1, vocab) probability tensors
-          kv_states   : list of k+1 past_key_values snapshots
+          kv_states   : list of k+1 normalized KV snapshots
                         kv_states[i] = draft KV after i draft tokens
-                        (kv_states[0] = draft_kv passed in)
           last_logits : draft logits after the k-th draft token
         """
         tokens: list[torch.Tensor] = []
         probs: list[torch.Tensor] = []
-        kv_states = [draft_kv]  # kv_states[i] = KV before drafting token i
+        kv_states = [draft_kv]  # kv_states[0] = KV before any draft token
         last_logits = draft_logits
 
         for _ in range(k):
@@ -97,7 +138,8 @@ class SpeculativeEngine:
             tokens.append(next_tok)
             probs.append(F.softmax(last_logits, dim=-1))
             out = self.draft(next_tok, past_key_values=kv_states[-1], use_cache=True)
-            kv_states.append(out.past_key_values)
+            # Snapshot immediately — _to_tuple() prevents DynamicCache aliasing
+            kv_states.append(_to_tuple(out.past_key_values))
             last_logits = out.logits[:, -1, :]
 
         return tokens, probs, kv_states, last_logits
@@ -107,20 +149,18 @@ class SpeculativeEngine:
         """Run target on all k draft tokens in one forward pass."""
         draft_seq = torch.cat(draft_tokens, dim=-1)  # (1, k)
         out = self.target(draft_seq, past_key_values=target_kv, use_cache=True)
-        return out.logits, out.past_key_values
+        return out.logits, _to_tuple(out.past_key_values)
 
     def _accept_reject(self, draft_tokens, draft_probs, target_logits, target_logits_prev):
         """
         Rejection sampling over k draft tokens.
 
-        target_logits_prev: target distribution at the position BEFORE seeing d_0.
-        Returns (accepted_token_list, n_accepted) where n_accepted is the count of
-        draft tokens that passed (before the resampled/bonus appended at end).
+        target_logits_prev: target distribution BEFORE seeing any draft token
+                            (used to check d_0).
+        Returns (accepted_token_list, n_accepted) where n_accepted = count of
+        draft tokens that passed acceptance before the bonus/resample appended at end.
         """
         eos = self.draft_tok.eos_token_id
-        # Target distribution for checking each draft position:
-        #   d_0 is checked against target_logits_prev (before seeing any draft)
-        #   d_i (i>0) is checked against target_logits[:, i-1, :] (after d_0..d_{i-1})
         target_dists = [F.softmax(target_logits_prev, dim=-1)] + [
             F.softmax(target_logits[:, i, :], dim=-1)
             for i in range(len(draft_tokens) - 1)
@@ -154,14 +194,6 @@ class SpeculativeEngine:
         accepted.append(bonus_tok)
         return accepted, n_accepted
 
-    @staticmethod
-    def _trim_kv(past_kv, length: int):
-        """Trim KV cache to keep only the first `length` sequence positions."""
-        return tuple(
-            (k[:, :, :length, :], v[:, :, :length, :])
-            for k, v in past_kv
-        )
-
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -176,7 +208,7 @@ class SpeculativeEngine:
         ids = self.target_tok.encode(prompt, return_tensors="pt").to(self.device)
         t0 = time.perf_counter()
 
-        # Pre-fill both models on the shared prompt
+        # Pre-fill both models; _prefill calls _to_tuple() internally
         target_kv, target_last_logits = self._prefill(self.target, ids)
         draft_kv, draft_last_logits = self._prefill(self.draft, ids)
 
@@ -192,13 +224,13 @@ class SpeculativeEngine:
             remaining = max_new_tokens - (generated.shape[1] - ids.shape[1])
             k_this = min(k, remaining)
 
-            # 1. Draft generates k tokens, saving intermediate KV states
+            # 1. Draft generates k tokens; saves immutable KV snapshots per step
             d_tokens, d_probs, draft_kv_states, _ = self._draft_k(
                 k_this, draft_kv, draft_last_logits
             )
 
-            # 2. Target verifies all k draft tokens in one forward pass
-            #    t_full_kv covers: prompt + all prev-accepted tokens + k draft tokens
+            # 2. Target verifies all k draft tokens in ONE forward pass
+            #    t_full_kv covers: context + k draft tokens
             t_logits, t_full_kv = self._verify(d_tokens, target_kv)
             n_target_calls += 1
             n_draft_total += k_this
@@ -216,24 +248,23 @@ class SpeculativeEngine:
             if any(t.item() == eos for t in accepted):
                 break
 
-            # 4. Update KV caches — O(1) per step
+            # 4. Update KV caches — O(1) per step, not O(n)
             #
-            # Draft: use saved state at n_acc (already covers accepted prefix),
-            #        then advance one step on last_tok.
+            # Draft: kv_states[n_acc] is the snapshot AFTER n_acc draft tokens
+            #        (the correct prefix). Run draft once on last_tok to advance.
             draft_kv = draft_kv_states[n_acc]
             out_d = self.draft(last_tok, past_key_values=draft_kv, use_cache=True)
-            draft_kv = out_d.past_key_values
+            draft_kv = _to_tuple(out_d.past_key_values)
             draft_last_logits = out_d.logits[:, -1, :]
 
-            # Target: trim t_full_kv to exactly the accepted prefix,
-            #         then advance one step on last_tok.
-            #   generated.shape[1] - 1  =  context_before_step + n_acc  ✓
+            # Target: trim t_full_kv to only the accepted prefix, then run on last_tok.
+            #   generated.shape[1] - 1 = context_before_this_step + n_acc
             trim_len = generated.shape[1] - 1
-            trimmed_target_kv = self._trim_kv(t_full_kv, trim_len)
+            trimmed_target_kv = _trim_kv(t_full_kv, trim_len)
             out_t = self.target(last_tok, past_key_values=trimmed_target_kv, use_cache=True)
-            target_kv = out_t.past_key_values
+            target_kv = _to_tuple(out_t.past_key_values)
             target_last_logits = out_t.logits[:, -1, :]
-            n_target_calls += 1  # 1 call for last_tok (was: ALL new tokens)
+            n_target_calls += 1  # 1 call for last_tok only (vs ALL new tokens before)
 
         total = time.perf_counter() - t0
         new_tokens = generated.shape[1] - ids.shape[1]
