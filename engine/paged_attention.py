@@ -235,6 +235,23 @@ class PagedAttentionEngine:
         for _ in range(new_b - old_b):
             self.allocator.alloc(seq_id)
 
+    @staticmethod
+    def _to_legacy(past_key_values) -> tuple:
+        """
+        Convert any DynamicCache-compatible object to a tuple-of-(k, v) per layer.
+
+        DynamicCache's internal attribute names changed in transformers 4.57.6
+        (key_cache / value_cache no longer exist as plain attributes).
+        to_legacy_cache() is the stable public API that works across all versions.
+        """
+        if hasattr(past_key_values, "to_legacy_cache"):
+            return past_key_values.to_legacy_cache()
+        # Older transformers — direct attribute access
+        return tuple(
+            (past_key_values.key_cache[i], past_key_values.value_cache[i])
+            for i in range(len(past_key_values.key_cache))
+        )
+
     def _store_kv(
         self,
         seq_id: int,
@@ -244,30 +261,31 @@ class PagedAttentionEngine:
     ) -> None:
         """Write KV vectors for positions [start_pos, end_pos) into the pool."""
         block_table = self.allocator.block_table(seq_id)
-        # DynamicCache exposes .key_cache / .value_cache lists (one tensor per layer).
-        key_cache = past_key_values.key_cache
-        val_cache = past_key_values.value_cache
+        # Extract as ((k0, v0), (k1, v1), …) — one pair per layer.
+        kv_pairs = self._to_legacy(past_key_values)
         for pos in range(start_pos, end_pos):
             block_idx = pos // self.block_size
             slot = pos % self.block_size
             phys_block = block_table[block_idx]
-            for layer in range(self.num_layers):
-                k = key_cache[layer][0, :, pos, :]  # (H, D)
-                v = val_cache[layer][0, :, pos, :]
-                self.pool.write(phys_block, slot, layer, k, v)
+            for layer, (k, v) in enumerate(kv_pairs):
+                self.pool.write(phys_block, slot, layer, k[0, :, pos, :], v[0, :, pos, :])
 
     def _build_past_kv(self, seq_id: int, seq_len: int) -> DynamicCache:
         """Reconstruct a DynamicCache by gathering KV from the paged pool."""
         block_table = self.allocator.block_table(seq_id)
+        # Build as legacy tuple-of-(k, v) pairs then convert via the stable classmethod.
+        # from_legacy_cache calls update() internally, which is the correct public API
+        # regardless of what internal storage DynamicCache uses in this version.
+        legacy = tuple(
+            self.pool.gather(block_table, seq_len, layer)
+            for layer in range(self.num_layers)
+        )
+        if hasattr(DynamicCache, "from_legacy_cache"):
+            return DynamicCache.from_legacy_cache(legacy)
+        # Fallback: populate via update() directly
         cache = DynamicCache()
-        for layer in range(self.num_layers):
-            k, v = self.pool.gather(block_table, seq_len, layer)
-            # Bypass update() to avoid torch.cat overhead: we already have the
-            # full gathered tensor, so set the cache lists directly.
-            cache.key_cache.append(k)
-            cache.value_cache.append(v)
-        if hasattr(cache, "_seen_tokens"):
-            cache._seen_tokens = seq_len
+        for layer, (k, v) in enumerate(legacy):
+            cache.update(k, v, layer)
         return cache
 
     # ------------------------------------------------------------------ generate

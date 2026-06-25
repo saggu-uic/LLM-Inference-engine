@@ -16,59 +16,33 @@ Expected tokens per target call = 1 + k * α  (where α = mean accept rate)
 
 Models: draft = gpt2 (117 M), target = gpt2-medium (345 M), k = 4.
 
-DynamicCache handling (transformers >= 4.36)
----------------------------------------------
-GPT-2 in transformers 4.36+ uses DynamicCache as past_key_values.
-DynamicCache is MUTABLE — model calls update it in place via torch.cat.
-torch.cat always creates a NEW tensor and replaces the list entry, so
-copying the list (not the tensors) is a safe, O(1) snapshot of the current
-state.  Future updates replace entries in the original list; the snapshot's
-list still references the old tensors.
+KV cache strategy
+------------------
+transformers >= 4.36 returns past_key_values as a DynamicCache object.
+The internal attribute names (key_cache etc.) changed in 4.57.6, so we
+treat DynamicCache as an opaque object and interact only through the public
+model API.
 
-_snapshot_kv(): shallow-copies the key/value lists → cheap, safe snapshot.
-_trim_kv():     builds a new DynamicCache with sliced tensors → for trimming
-                t_full_kv back to the accepted prefix after rejection.
+Strategy:
+  1. Before each step, pass copy.deepcopy() of each cache to the functions
+     that would mutate it (_draft_k gets a draft copy, _verify gets a target
+     copy).  The originals stay at the pre-step state.
+  2. After acceptance, re-run the draft and target on JUST the accepted draft
+     tokens (in one batched call) plus last_tok.  Starting from the pre-step
+     states gives the correct KV without any trimming or attribute access.
+
+Cost per step:
+  k draft calls (speculative)  + 1 target call (verify, k tokens in parallel)
+  + 1-2 draft calls (accepted batch + last_tok)
+  + 1-2 target calls (accepted batch + last_tok)
+  ≤  k+2 draft  +  3 target  — bounded by k, never O(sequence length)
 """
+import copy
 import time
 import torch
 import torch.nn.functional as F
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
-from transformers.cache_utils import DynamicCache
 
-
-# ---------------------------------------------------------------------------
-# DynamicCache utilities
-# ---------------------------------------------------------------------------
-
-def _snapshot_kv(cache: DynamicCache) -> DynamicCache:
-    """
-    Cheap, safe snapshot of a DynamicCache.
-
-    DynamicCache.update() replaces self.key_cache[i] with a brand-new tensor
-    (torch.cat result), so copying the list captures the current tensor
-    references without risk of aliasing from future updates.
-    """
-    snap = DynamicCache()
-    snap.key_cache = list(cache.key_cache)
-    snap.value_cache = list(cache.value_cache)
-    if hasattr(cache, "_seen_tokens"):
-        snap._seen_tokens = cache._seen_tokens
-    return snap
-
-
-def _trim_kv(cache: DynamicCache, length: int) -> DynamicCache:
-    """Return a new DynamicCache containing only the first `length` positions."""
-    trimmed = DynamicCache()
-    trimmed.key_cache = [k[:, :, :length, :] for k in cache.key_cache]
-    trimmed.value_cache = [v[:, :, :length, :] for v in cache.value_cache]
-    if hasattr(trimmed, "_seen_tokens"):
-        trimmed._seen_tokens = length
-    return trimmed
-
-
-# ---------------------------------------------------------------------------
-# Engine
-# ---------------------------------------------------------------------------
 
 class SpeculativeEngine:
     def __init__(
@@ -96,52 +70,43 @@ class SpeculativeEngine:
 
     @torch.no_grad()
     def _prefill(self, model, ids):
-        """Run the full prompt; return (DynamicCache, last_logits)."""
+        """Run full prompt; return (past_kv, last_logits)."""
         out = model(ids, use_cache=True)
         return out.past_key_values, out.logits[:, -1, :]
 
     @torch.no_grad()
-    def _draft_k(self, k: int, draft_kv: DynamicCache, draft_logits):
+    def _draft_k(self, k: int, draft_kv, draft_logits):
         """
-        Generate k tokens from the draft model greedily.
-
-        draft_kv is mutated in place (each model call extends it).
-        We take a list snapshot BEFORE each step so we can recover
-        any accepted prefix in O(1):
-
-          kv_states[i] = state after i draft tokens
-          kv_states[0] = snapshot of the incoming draft_kv (0 tokens added)
-          kv_states[k] = snapshot after all k tokens
+        Generate k tokens from the draft model (draft_kv is mutated in place).
+        Caller should pass a deepcopy if the original KV must be preserved.
         """
         tokens: list[torch.Tensor] = []
         probs: list[torch.Tensor] = []
-        # Snapshot BEFORE the first step (= state entering this call)
-        kv_states: list[DynamicCache] = [_snapshot_kv(draft_kv)]
         last_logits = draft_logits
-
         for _ in range(k):
             next_tok = last_logits.argmax(dim=-1, keepdim=True)
             tokens.append(next_tok)
             probs.append(F.softmax(last_logits, dim=-1))
-            # Mutate draft_kv with this token's KV
             out = self.draft(next_tok, past_key_values=draft_kv, use_cache=True)
+            draft_kv = out.past_key_values
             last_logits = out.logits[:, -1, :]
-            # Snapshot AFTER mutation: list copy captures current tensor refs
-            kv_states.append(_snapshot_kv(draft_kv))
-
-        return tokens, probs, kv_states, last_logits
+        return tokens, probs
 
     @torch.no_grad()
-    def _verify(self, draft_tokens, target_kv: DynamicCache):
-        """Run target on all k draft tokens; target_kv is mutated in place."""
+    def _verify(self, draft_tokens, target_kv):
+        """
+        Run target on k draft tokens in one forward pass (target_kv mutated).
+        Caller should pass a deepcopy if the original KV must be preserved.
+        """
         draft_seq = torch.cat(draft_tokens, dim=-1)  # (1, k)
         out = self.target(draft_seq, past_key_values=target_kv, use_cache=True)
-        return out.logits, out.past_key_values  # past_key_values IS target_kv, mutated
+        return out.logits  # only logits needed; mutated KV is discarded
 
     def _accept_reject(self, draft_tokens, draft_probs, target_logits, target_logits_prev):
         """
         Rejection sampling.  Returns (accepted_list, n_accepted) where
-        n_accepted counts draft tokens that passed (bonus/resample appended last).
+        n_accepted = count of draft tokens that passed acceptance.
+        The resampled or bonus token is always appended last.
         """
         eos = self.draft_tok.eos_token_id
         target_dists = [F.softmax(target_logits_prev, dim=-1)] + [
@@ -167,7 +132,7 @@ class SpeculativeEngine:
                 accepted.append(torch.multinomial(residual[0], 1).unsqueeze(0))
                 return accepted, n_accepted
 
-        # All k accepted → bonus token
+        # All k accepted → bonus token from target's distribution at position k
         bonus_dist = F.softmax(target_logits[:, -1, :], dim=-1)
         accepted.append(torch.multinomial(bonus_dist[0], 1).unsqueeze(0))
         return accepted, n_accepted
@@ -186,7 +151,7 @@ class SpeculativeEngine:
         ids = self.target_tok.encode(prompt, return_tensors="pt").to(self.device)
         t0 = time.perf_counter()
 
-        # Pre-fill both models on the full prompt
+        # Pre-fill both models on the shared prompt
         target_kv, target_last_logits = self._prefill(self.target, ids)
         draft_kv, draft_last_logits = self._prefill(self.draft, ids)
 
@@ -202,23 +167,21 @@ class SpeculativeEngine:
             remaining = max_new_tokens - (generated.shape[1] - ids.shape[1])
             k_this = min(k, remaining)
 
-            # 1. Draft generates k tokens, mutating draft_kv; saves snapshots
-            d_tokens, d_probs, draft_kv_states, _ = self._draft_k(
-                k_this, draft_kv, draft_last_logits
+            # 1. Pass COPIES so that draft_kv / target_kv remain as pre-step bases.
+            #    copy.deepcopy handles DynamicCache regardless of internal attributes.
+            d_tokens, d_probs = self._draft_k(
+                k_this, copy.deepcopy(draft_kv), draft_last_logits
             )
-
-            # 2. Target verifies k draft tokens in ONE pass, mutating target_kv
-            #    t_full_kv IS target_kv (same object, now extended by k tokens)
-            t_logits, t_full_kv = self._verify(d_tokens, target_kv)
+            t_logits = self._verify(d_tokens, copy.deepcopy(target_kv))
             n_target_calls += 1
             n_draft_total += k_this
 
-            # 3. Acceptance sampling
+            # 2. Acceptance sampling
             accepted, n_acc = self._accept_reject(
                 d_tokens, d_probs, t_logits, target_last_logits
             )
             n_accepted_total += n_acc
-            last_tok = accepted[-1]  # resampled or bonus token
+            last_tok = accepted[-1]
 
             new_ids = torch.cat(accepted, dim=-1)
             generated = torch.cat([generated, new_ids], dim=-1)
@@ -226,25 +189,33 @@ class SpeculativeEngine:
             if any(t.item() == eos for t in accepted):
                 break
 
-            # 4. O(1) KV update — no re-prefill
+            # 3. Update KV caches from pre-step base — O(k) calls, not O(n).
             #
-            # Draft: kv_states[n_acc] = snapshot after exactly n_acc draft tokens.
-            # Snapshot it again (fresh list copy) so the model can safely mutate it,
-            # then run one forward pass to include last_tok.
-            draft_kv = _snapshot_kv(draft_kv_states[n_acc])
-            out_d = self.draft(last_tok, past_key_values=draft_kv, use_cache=True)
-            draft_kv = out_d.past_key_values   # = draft_kv, extended by last_tok
-            draft_last_logits = out_d.logits[:, -1, :]
+            # draft_kv and target_kv are still the PRE-STEP states because
+            # _draft_k and _verify each received a deepcopy.
+            #
+            # Run on the accepted draft tokens as one batched call (if any),
+            # then one call for last_tok.  Same 2-call cost as trimming but
+            # without touching any DynamicCache internals.
+            accepted_draft = accepted[:n_acc]  # tokens d_0 … d_{n_acc-1}
 
-            # Target: t_full_kv has k extra draft tokens we don't want.
-            # Trim to the accepted prefix, then extend with last_tok.
-            # generated.shape[1] - 1 = (context before this step) + n_acc
-            trim_len = generated.shape[1] - 1
-            target_kv = _trim_kv(t_full_kv, trim_len)
-            out_t = self.target(last_tok, past_key_values=target_kv, use_cache=True)
-            target_kv = out_t.past_key_values  # = target_kv, extended by last_tok
-            target_last_logits = out_t.logits[:, -1, :]
-            n_target_calls += 1  # 1 call for last_tok only (vs all new tokens before)
+            if accepted_draft:
+                batch = torch.cat(accepted_draft, dim=-1)  # (1, n_acc)
+                out = self.draft(batch, past_key_values=draft_kv, use_cache=True)
+                draft_kv = out.past_key_values
+            out = self.draft(last_tok, past_key_values=draft_kv, use_cache=True)
+            draft_kv = out.past_key_values
+            draft_last_logits = out.logits[:, -1, :]
+
+            if accepted_draft:
+                batch = torch.cat(accepted_draft, dim=-1)
+                out = self.target(batch, past_key_values=target_kv, use_cache=True)
+                target_kv = out.past_key_values
+                n_target_calls += 1
+            out = self.target(last_tok, past_key_values=target_kv, use_cache=True)
+            target_kv = out.past_key_values
+            target_last_logits = out.logits[:, -1, :]
+            n_target_calls += 1
 
         total = time.perf_counter() - t0
         new_tokens = generated.shape[1] - ids.shape[1]
