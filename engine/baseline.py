@@ -17,6 +17,12 @@ class BaselineEngine:
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.model.to(self.device).eval()
 
+    def _sync(self):
+        """Wait for queued CUDA kernels so perf_counter measures compute, not
+        async launch time.  No-op on CPU."""
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+
     @torch.no_grad()
     def generate(
         self,
@@ -29,6 +35,7 @@ class BaselineEngine:
         generated = input_ids.clone()
 
         ttft = None
+        self._sync()
         t0 = time.perf_counter()
 
         for i in range(max_new_tokens):
@@ -45,11 +52,13 @@ class BaselineEngine:
             generated = torch.cat([generated, next_token], dim=-1)
 
             if ttft is None:
+                self._sync()
                 ttft = time.perf_counter() - t0
 
             if next_token.item() == self.tokenizer.eos_token_id:
                 break
 
+        self._sync()
         total = time.perf_counter() - t0
         new_tokens = generated.shape[1] - input_ids.shape[1]
         text = self.tokenizer.decode(generated[0], skip_special_tokens=True)

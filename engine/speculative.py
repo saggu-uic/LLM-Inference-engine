@@ -18,26 +18,24 @@ Models: draft = gpt2 (117 M), target = gpt2-medium (345 M), k = 4.
 
 KV cache strategy
 ------------------
-transformers >= 4.36 returns past_key_values as a DynamicCache object.
-The internal attribute names (key_cache etc.) changed in 4.57.6, so we
-treat DynamicCache as an opaque object and interact only through the public
-model API.
+transformers returns past_key_values as a DynamicCache.  We never touch its
+internal attributes — we only use two public operations:
+  * model(tokens, past_key_values=cache)  advances the cache in place
+  * cache.crop(length)                    trims the cache back to `length`
 
-Strategy:
-  1. Before each step, pass copy.deepcopy() of each cache to the functions
-     that would mutate it (_draft_k gets a draft copy, _verify gets a target
-     copy).  The originals stay at the pre-step state.
-  2. After acceptance, re-run the draft and target on JUST the accepted draft
-     tokens (in one batched call) plus last_tok.  Starting from the pre-step
-     states gives the correct KV without any trimming or attribute access.
+Per-step flow (this is the whole point of speculative decoding):
+  1. Draft proposes k tokens, advancing draft_kv from L → L+k.
+  2. Verify: ONE target forward pass over all k draft tokens at once,
+     advancing target_kv from L → L+k and giving logits for every position.
+  3. Acceptance sampling keeps the first n_acc tokens + 1 resampled/bonus token.
+  4. crop() both caches back to L+n_acc (discarding rejected positions whose KV
+     was already computed in step 2), then one forward pass commits last_tok.
 
-Cost per step:
-  k draft calls (speculative)  + 1 target call (verify, k tokens in parallel)
-  + 1-2 draft calls (accepted batch + last_tok)
-  + 1-2 target calls (accepted batch + last_tok)
-  ≤  k+2 draft  +  3 target  — bounded by k, never O(sequence length)
+Cost per step:  k+1 draft calls  +  2 target calls  (verify + last_tok).
+The k draft tokens are verified in a SINGLE target pass — that is what lets the
+target run fewer times than the number of tokens produced.  Nothing here scales
+with sequence length.
 """
-import copy
 import time
 import torch
 import torch.nn.functional as F
@@ -68,6 +66,13 @@ class SpeculativeEngine:
     # Helpers
     # ------------------------------------------------------------------
 
+    def _sync(self):
+        """Block until pending CUDA kernels finish so timings are real.
+        On GPU, kernel launches are async; without this perf_counter would
+        measure launch time, not compute.  No-op on CPU."""
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+
     @torch.no_grad()
     def _prefill(self, model, ids):
         """Run full prompt; return (past_kv, last_logits)."""
@@ -77,8 +82,8 @@ class SpeculativeEngine:
     @torch.no_grad()
     def _draft_k(self, k: int, draft_kv, draft_logits):
         """
-        Generate k tokens from the draft model (draft_kv is mutated in place).
-        Caller should pass a deepcopy if the original KV must be preserved.
+        Propose k tokens from the draft model, advancing draft_kv in place
+        from length L to L+k.  Returns (tokens, probs, advanced_draft_kv).
         """
         tokens: list[torch.Tensor] = []
         probs: list[torch.Tensor] = []
@@ -90,17 +95,17 @@ class SpeculativeEngine:
             out = self.draft(next_tok, past_key_values=draft_kv, use_cache=True)
             draft_kv = out.past_key_values
             last_logits = out.logits[:, -1, :]
-        return tokens, probs
+        return tokens, probs, draft_kv
 
     @torch.no_grad()
     def _verify(self, draft_tokens, target_kv):
         """
-        Run target on k draft tokens in one forward pass (target_kv mutated).
-        Caller should pass a deepcopy if the original KV must be preserved.
+        Verify all k draft tokens in ONE target forward pass, advancing
+        target_kv in place from L to L+k.  Returns (logits, advanced_target_kv).
         """
         draft_seq = torch.cat(draft_tokens, dim=-1)  # (1, k)
         out = self.target(draft_seq, past_key_values=target_kv, use_cache=True)
-        return out.logits  # only logits needed; mutated KV is discarded
+        return out.logits, out.past_key_values
 
     def _accept_reject(self, draft_tokens, draft_probs, target_logits, target_logits_prev):
         """
@@ -149,12 +154,16 @@ class SpeculativeEngine:
         k: int = 4,
     ) -> tuple[str, dict]:
         ids = self.target_tok.encode(prompt, return_tensors="pt").to(self.device)
+        self._sync()
         t0 = time.perf_counter()
 
-        # Pre-fill both models on the shared prompt
+        # Pre-fill both models on the shared prompt.
+        # L = committed length: prompt + tokens accepted so far.
         target_kv, target_last_logits = self._prefill(self.target, ids)
         draft_kv, draft_last_logits = self._prefill(self.draft, ids)
+        L = ids.shape[1]
 
+        self._sync()
         ttft = time.perf_counter() - t0
         generated = ids.clone()
 
@@ -167,16 +176,15 @@ class SpeculativeEngine:
             remaining = max_new_tokens - (generated.shape[1] - ids.shape[1])
             k_this = min(k, remaining)
 
-            # 1. Pass COPIES so that draft_kv / target_kv remain as pre-step bases.
-            #    copy.deepcopy handles DynamicCache regardless of internal attributes.
-            d_tokens, d_probs = self._draft_k(
-                k_this, copy.deepcopy(draft_kv), draft_last_logits
-            )
-            t_logits = self._verify(d_tokens, copy.deepcopy(target_kv))
-            n_target_calls += 1
+            # 1. Draft proposes k tokens — advances draft_kv L → L+k
+            d_tokens, d_probs, draft_kv = self._draft_k(k_this, draft_kv, draft_last_logits)
             n_draft_total += k_this
 
-            # 2. Acceptance sampling
+            # 2. Verify all k in ONE target pass — advances target_kv L → L+k
+            t_logits, target_kv = self._verify(d_tokens, target_kv)
+            n_target_calls += 1
+
+            # 3. Acceptance sampling
             accepted, n_acc = self._accept_reject(
                 d_tokens, d_probs, t_logits, target_last_logits
             )
@@ -189,34 +197,25 @@ class SpeculativeEngine:
             if any(t.item() == eos for t in accepted):
                 break
 
-            # 3. Update KV caches from pre-step base — O(k) calls, not O(n).
-            #
-            # draft_kv and target_kv are still the PRE-STEP states because
-            # _draft_k and _verify each received a deepcopy.
-            #
-            # Run on the accepted draft tokens as one batched call (if any),
-            # then one call for last_tok.  Same 2-call cost as trimming but
-            # without touching any DynamicCache internals.
-            accepted_draft = accepted[:n_acc]  # tokens d_0 … d_{n_acc-1}
+            # 4. Commit: crop both caches to the accepted prefix (L+n_acc), then
+            #    one forward pass each to add last_tok's KV and next-step logits.
+            #    The verify pass already computed KV for all k positions, so the
+            #    accepted ones are reused for free; only last_tok needs a forward.
+            target_kv.crop(L + n_acc)
+            draft_kv.crop(L + n_acc)
 
-            if accepted_draft:
-                batch = torch.cat(accepted_draft, dim=-1)  # (1, n_acc)
-                out = self.draft(batch, past_key_values=draft_kv, use_cache=True)
-                draft_kv = out.past_key_values
-            out = self.draft(last_tok, past_key_values=draft_kv, use_cache=True)
-            draft_kv = out.past_key_values
-            draft_last_logits = out.logits[:, -1, :]
-
-            if accepted_draft:
-                batch = torch.cat(accepted_draft, dim=-1)
-                out = self.target(batch, past_key_values=target_kv, use_cache=True)
-                target_kv = out.past_key_values
-                n_target_calls += 1
-            out = self.target(last_tok, past_key_values=target_kv, use_cache=True)
-            target_kv = out.past_key_values
-            target_last_logits = out.logits[:, -1, :]
+            ot = self.target(last_tok, past_key_values=target_kv, use_cache=True)
+            target_kv = ot.past_key_values
+            target_last_logits = ot.logits[:, -1, :]
             n_target_calls += 1
 
+            od = self.draft(last_tok, past_key_values=draft_kv, use_cache=True)
+            draft_kv = od.past_key_values
+            draft_last_logits = od.logits[:, -1, :]
+
+            L += n_acc + 1
+
+        self._sync()
         total = time.perf_counter() - t0
         new_tokens = generated.shape[1] - ids.shape[1]
         text = self.target_tok.decode(generated[0], skip_special_tokens=True)

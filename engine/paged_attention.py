@@ -224,6 +224,12 @@ class PagedAttentionEngine:
 
     # ------------------------------------------------------------------ helpers
 
+    def _sync(self):
+        """Wait for queued CUDA kernels so perf_counter measures compute, not
+        async launch time.  No-op on CPU."""
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+
     def _blocks_needed(self, seq_len: int) -> int:
         return math.ceil(seq_len / self.block_size)
 
@@ -301,6 +307,7 @@ class PagedAttentionEngine:
     ) -> tuple[str, dict]:
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
         prompt_len = input_ids.shape[1]
+        self._sync()
         t0 = time.perf_counter()
 
         # ---- pre-fill ----
@@ -308,6 +315,7 @@ class PagedAttentionEngine:
         out = self.model(input_ids, use_cache=True)
         self._store_kv(seq_id, out.past_key_values, 0, prompt_len)
         last_logits = out.logits[:, -1, :]
+        self._sync()
         ttft = time.perf_counter() - t0
 
         generated_ids: list[int] = []
@@ -335,6 +343,7 @@ class PagedAttentionEngine:
             last_logits = out.logits[:, -1, :]
 
         # ---- cleanup ----
+        self._sync()
         peak_utilization = self.allocator.utilization
         blocks_used = self.allocator.num_used
         self.allocator.free(seq_id)

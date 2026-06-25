@@ -106,6 +106,11 @@ class PagedContinuousBatchingEngine:
     # ------------------------------------------------------------------ paged KV helpers
     # (same DynamicCache-agnostic API as PagedAttentionEngine)
 
+    def _sync(self):
+        """Wait for queued CUDA kernels so wall-clock timing is real. No-op on CPU."""
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+
     def _blocks_needed(self, length: int) -> int:
         return math.ceil(length / self.block_size)
 
@@ -201,6 +206,7 @@ class PagedContinuousBatchingEngine:
         memory accounting keys (peak_pool_util, naive_kv_mb, paged_kv_mb).
         """
         eos = self.tokenizer.eos_token_id
+        self._sync()
         t0 = time.perf_counter()
         finished: list[_Seq] = []
         peak_util = 0.0
@@ -235,6 +241,7 @@ class PagedContinuousBatchingEngine:
                 self.allocator.free(seq.seq_id)   # ← blocks back in free list now
                 finished.append(seq)
 
+        self._sync()
         total = time.perf_counter() - t0
         total_generated = sum(len(s.generated) for s in finished)
 

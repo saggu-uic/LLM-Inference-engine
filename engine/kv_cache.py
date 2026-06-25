@@ -30,6 +30,12 @@ class KVCacheEngine:
         # prefix_hash → (past_key_values, prefix_token_count)
         self._prefix_store: dict[str, tuple[KVCache, int]] = {}
 
+    def _sync(self):
+        """Wait for queued CUDA kernels so perf_counter measures compute, not
+        async launch time.  No-op on CPU."""
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -75,6 +81,7 @@ class KVCacheEngine:
         its KV is reused — the model never re-processes those tokens.
         """
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
+        self._sync()
         t0 = time.perf_counter()
 
         prefix_hit = False
@@ -102,6 +109,7 @@ class KVCacheEngine:
             # Standard pre-fill: one shot over the full prompt
             past_kv, last_logits = self._prefill(input_ids)
 
+        self._sync()
         ttft = time.perf_counter() - t0
         generated_ids = []
 
@@ -121,6 +129,7 @@ class KVCacheEngine:
             past_kv = out.past_key_values
             last_logits = out.logits[:, -1, :]
 
+        self._sync()
         total = time.perf_counter() - t0
         full_ids = torch.cat(
             [input_ids, torch.tensor([generated_ids], device=self.device)], dim=-1

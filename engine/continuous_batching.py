@@ -56,6 +56,16 @@ class StaticBatchingEngine:
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.model.to(self.device).eval()
         self.tokenizer.pad_token = self.tokenizer.eos_token
+        # LEFT padding is required for batched autoregressive generation: it
+        # right-aligns every prompt so logits[:, -1, :] is always the true last
+        # token.  With right padding, short prompts would read logits after pad
+        # positions (garbage) and corrupt their own generation.
+        self.tokenizer.padding_side = "left"
+
+    def _sync(self):
+        """Wait for queued CUDA kernels so wall-clock timing is real. No-op on CPU."""
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
 
     @torch.no_grad()
     def run(
@@ -65,6 +75,7 @@ class StaticBatchingEngine:
         batch_size: int = 4,
     ) -> dict:
         eos = self.tokenizer.eos_token_id
+        self._sync()
         t0 = time.perf_counter()
         total_generated = 0
         all_texts = []
@@ -88,7 +99,15 @@ class StaticBatchingEngine:
             step_max = max(batch_max)
 
             for step in range(step_max):
-                outputs = self.model(generated, attention_mask=attention_mask)
+                # Left padding shifts absolute positions, so we must supply
+                # position_ids derived from the mask (pad slots clamp to 0 but
+                # are ignored by attention anyway).  Without this, padded rows
+                # get wrong positional encodings and degenerate.
+                position_ids = attention_mask.long().cumsum(dim=-1) - 1
+                position_ids.clamp_(min=0)
+                outputs = self.model(
+                    generated, attention_mask=attention_mask, position_ids=position_ids
+                )
                 logits = outputs.logits[:, -1, :]
                 next_tokens = logits.argmax(dim=-1)  # (B,)
 
@@ -108,16 +127,21 @@ class StaticBatchingEngine:
                 if not alive.any():
                     break
 
-            prompt_lens = enc["attention_mask"].sum(dim=-1)
-            for i, (ids, plen) in enumerate(zip(generated, prompt_lens)):
-                new = ids[plen:].tolist()
+            # With left padding the prompt is right-aligned, so generated tokens
+            # start at the fixed padded width for every row.
+            padded_len = input_ids.shape[1]
+            for i, ids in enumerate(generated):
+                new = ids[padded_len:].tolist()
+                new = new[: batch_max[i]]          # respect this request's budget
                 if eos in new:
                     new = new[: new.index(eos)]
                 total_generated += len(new)
+                # Left-pad tokens are eos and get dropped by skip_special_tokens.
                 all_texts.append(
-                    self.tokenizer.decode(ids[:plen].tolist() + new, skip_special_tokens=True)
+                    self.tokenizer.decode(ids[:padded_len].tolist() + new, skip_special_tokens=True)
                 )
 
+        self._sync()
         total = time.perf_counter() - t0
         return {
             "strategy": "static",
@@ -139,6 +163,11 @@ class ContinuousBatchingEngine:
         self.model = GPT2LMHeadModel.from_pretrained(model_name, dtype=torch.float32)
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.model.to(self.device).eval()
+
+    def _sync(self):
+        """Wait for queued CUDA kernels so wall-clock timing is real. No-op on CPU."""
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
 
     @torch.no_grad()
     def _prefill_one(self, seq: _Sequence):
@@ -165,6 +194,7 @@ class ContinuousBatchingEngine:
         max_batch_size: int = 4,
     ) -> dict:
         eos = self.tokenizer.eos_token_id
+        self._sync()
         t0 = time.perf_counter()
         total_generated = 0
         all_texts = []
@@ -200,6 +230,7 @@ class ContinuousBatchingEngine:
                 full = seq.input_ids[0].tolist() + seq.generated
                 all_texts.append(self.tokenizer.decode(full, skip_special_tokens=True))
 
+        self._sync()
         total = time.perf_counter() - t0
         # Reorder outputs to match input order
         finished.sort(key=lambda s: s.request_id)
