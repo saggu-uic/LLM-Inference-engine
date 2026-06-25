@@ -97,7 +97,20 @@ print(f"    Naive pre-allocation : {mc['naive_mb']:.2f} MB")
 print(f"    Paged allocation     : {mc['paged_mb']:.2f} MB")
 print(f"    Savings              : {mc['savings_mb']:.2f} MB  ({mc['savings_pct']:.1f}%)")
 
-# ── 5. Speculative decoding ──────────────────────────────────────────────────
+# ── 5. Paged continuous batching ────────────────────────────────────────────
+divider("5. Paged Continuous Batching (paged memory + iteration-level scheduling)")
+from engine.paged_continuous import PagedContinuousBatchingEngine
+
+pc_eng = PagedContinuousBatchingEngine(num_blocks=128)
+pc_out = pc_eng.run(prompts, max_toks, max_batch_size=4)
+print(f"\n  Time         : {pc_out['total_time_s']:.2f}s")
+print(f"  Throughput   : {pc_out['throughput_tps']:.1f} tok/s")
+print(f"  Total tokens : {pc_out['total_tokens']}")
+print(f"  Peak pool    : {pc_out['peak_pool_util']}")
+print(f"  Naive KV mem : {pc_out['naive_kv_mb']}")
+print(f"  Paged KV mem : {pc_out['paged_kv_mb']}  (saved {pc_out['savings_pct']})")
+
+# ── 6. Speculative decoding ──────────────────────────────────────────────────
 if not args.skip_spec:
     divider("5. Speculative Decoding (gpt2 draft → gpt2-medium target, k=4)")
     from engine.speculative import SpeculativeEngine

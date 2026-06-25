@@ -14,8 +14,9 @@ from benchmarks.metrics import BenchmarkResult, print_table
 from engine.baseline import BaselineEngine
 from engine.kv_cache import KVCacheEngine
 from engine.continuous_batching import StaticBatchingEngine, ContinuousBatchingEngine
-from engine.speculative import SpeculativeEngine
 from engine.paged_attention import PagedAttentionEngine
+from engine.paged_continuous import PagedContinuousBatchingEngine
+from engine.speculative import SpeculativeEngine
 
 # ─────────────────────────────────────────────────────────────────────────────
 PROMPT = (
@@ -99,7 +100,7 @@ def bench_batching() -> list[BenchmarkResult]:
 
 
 def bench_paged(n_tokens: int, n_repeats: int) -> BenchmarkResult:
-    print("\n[4/6] Paged attention …")
+    print("\n[4/7] Paged attention …")
     eng = PagedAttentionEngine()
     stats = [eng.generate(PROMPT, max_new_tokens=n_tokens)[1] for _ in range(n_repeats)]
     s = avg(stats)
@@ -113,8 +114,24 @@ def bench_paged(n_tokens: int, n_repeats: int) -> BenchmarkResult:
     )
 
 
+def bench_paged_continuous() -> BenchmarkResult:
+    print("\n[5/7] Paged continuous batching …")
+    eng = PagedContinuousBatchingEngine(num_blocks=128)
+    out = eng.run(BATCH_PROMPTS, BATCH_MAX_TOKENS, max_batch_size=4)
+    return BenchmarkResult(
+        "Paged continuous (max=4)", 0, out["throughput_tps"],
+        out["total_time_s"] * 1000, mem_mb(),
+        extra={
+            "total_tok": out["total_tokens"],
+            "pool_util": out["peak_pool_util"],
+            "paged_kv": out["paged_kv_mb"],
+            "saved": out["savings_pct"],
+        },
+    )
+
+
 def bench_target_only(n_tokens: int, n_repeats: int) -> BenchmarkResult:
-    print("\n[5/6] Target-only baseline (gpt2-medium + KV cache) …")
+    print("\n[6/7] Target-only baseline (gpt2-medium + KV cache) …")
     eng = KVCacheEngine(model_name="gpt2-medium")
     stats = [eng.generate(PROMPT, max_new_tokens=n_tokens)[1] for _ in range(n_repeats)]
     s = avg(stats)
@@ -122,7 +139,7 @@ def bench_target_only(n_tokens: int, n_repeats: int) -> BenchmarkResult:
 
 
 def bench_speculative(n_tokens: int, k: int = 4) -> BenchmarkResult:
-    print(f"\n[6/6] Speculative decoding (gpt2 → gpt2-medium, k={k}) …")
+    print(f"\n[7/7] Speculative decoding (gpt2 → gpt2-medium, k={k}) …")
     eng = SpeculativeEngine()
     _, stats = eng.generate(PROMPT, max_new_tokens=n_tokens, k=k)
     return BenchmarkResult(
@@ -152,6 +169,7 @@ def main():
     all_results.extend(bench_kv_cache(n_tokens, n_repeats))
     all_results.extend(bench_batching())
     all_results.append(bench_paged(n_tokens, n_repeats))
+    all_results.append(bench_paged_continuous())
 
     if not args.skip_spec:
         all_results.append(bench_target_only(n_tokens, n_repeats))
