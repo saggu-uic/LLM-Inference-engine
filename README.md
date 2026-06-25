@@ -30,7 +30,7 @@ python -m benchmarks.run_all --skip-spec   # skip speculative (avoids downloadin
 
 ---
 
-## What we built
+## What I built
 
 Six inference engines, each isolating one optimization:
 
