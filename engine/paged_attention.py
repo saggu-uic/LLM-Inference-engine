@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 
 import torch
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
+from transformers.cache_utils import DynamicCache
 
 
 BLOCK_SIZE = 16   # tokens per block  (vLLM default)
@@ -237,28 +238,37 @@ class PagedAttentionEngine:
     def _store_kv(
         self,
         seq_id: int,
-        past_key_values: tuple,
+        past_key_values,   # DynamicCache (transformers >= 4.36)
         start_pos: int,
         end_pos: int,
     ) -> None:
         """Write KV vectors for positions [start_pos, end_pos) into the pool."""
         block_table = self.allocator.block_table(seq_id)
+        # DynamicCache exposes .key_cache / .value_cache lists (one tensor per layer).
+        key_cache = past_key_values.key_cache
+        val_cache = past_key_values.value_cache
         for pos in range(start_pos, end_pos):
             block_idx = pos // self.block_size
             slot = pos % self.block_size
             phys_block = block_table[block_idx]
             for layer in range(self.num_layers):
-                k = past_key_values[layer][0][0, :, pos, :]  # (H, D)
-                v = past_key_values[layer][1][0, :, pos, :]
+                k = key_cache[layer][0, :, pos, :]  # (H, D)
+                v = val_cache[layer][0, :, pos, :]
                 self.pool.write(phys_block, slot, layer, k, v)
 
-    def _build_past_kv(self, seq_id: int, seq_len: int) -> tuple:
-        """Reconstruct past_key_values by gathering from the paged pool."""
+    def _build_past_kv(self, seq_id: int, seq_len: int) -> DynamicCache:
+        """Reconstruct a DynamicCache by gathering KV from the paged pool."""
         block_table = self.allocator.block_table(seq_id)
-        return tuple(
-            self.pool.gather(block_table, seq_len, layer)
-            for layer in range(self.num_layers)
-        )
+        cache = DynamicCache()
+        for layer in range(self.num_layers):
+            k, v = self.pool.gather(block_table, seq_len, layer)
+            # Bypass update() to avoid torch.cat overhead: we already have the
+            # full gathered tensor, so set the cache lists directly.
+            cache.key_cache.append(k)
+            cache.value_cache.append(v)
+        if hasattr(cache, "_seen_tokens"):
+            cache._seen_tokens = seq_len
+        return cache
 
     # ------------------------------------------------------------------ generate
 
