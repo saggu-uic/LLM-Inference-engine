@@ -117,13 +117,23 @@ class PagedContinuousBatchingEngine:
 
     @staticmethod
     def _to_legacy(cache) -> tuple:
-        """Extract per-layer (k, v) from DynamicCache, API-version-agnostic."""
+        """
+        Extract per-layer (k, v) tensors from a DynamicCache, across versions.
+          * >= 4.54 : cache.layers[i].keys / .values   (current — verified 4.57.x)
+          * 4.36-4.53: cache.key_cache[i] / .value_cache[i]
+          * deprecated fallback: to_legacy_cache()
+        """
+        layers = getattr(cache, "layers", None)
+        if layers is not None:
+            return tuple((lyr.keys, lyr.values) for lyr in layers)
+        if hasattr(cache, "key_cache"):
+            return tuple(
+                (cache.key_cache[i], cache.value_cache[i])
+                for i in range(len(cache.key_cache))
+            )
         if hasattr(cache, "to_legacy_cache"):
             return cache.to_legacy_cache()
-        return tuple(
-            (cache.key_cache[i], cache.value_cache[i])
-            for i in range(len(cache.key_cache))
-        )
+        raise RuntimeError(f"Unsupported KV cache layout: {type(cache)}")
 
     def _store_kv(self, seq_id: int, cache, start: int, end: int) -> None:
         block_table = self.allocator.block_table(seq_id)
@@ -135,15 +145,12 @@ class PagedContinuousBatchingEngine:
                 self.kv_pool.write(phys, slot, layer, k[0, :, pos, :], v[0, :, pos, :])
 
     def _build_cache(self, seq_id: int, seq_len: int) -> DynamicCache:
+        """Rebuild a DynamicCache from paged blocks via update() — the one
+        Cache API stable across every transformers version."""
         block_table = self.allocator.block_table(seq_id)
-        legacy = tuple(
-            self.kv_pool.gather(block_table, seq_len, layer)
-            for layer in range(self.num_layers)
-        )
-        if hasattr(DynamicCache, "from_legacy_cache"):
-            return DynamicCache.from_legacy_cache(legacy)
         cache = DynamicCache()
-        for layer, (k, v) in enumerate(legacy):
+        for layer in range(self.num_layers):
+            k, v = self.kv_pool.gather(block_table, seq_len, layer)
             cache.update(k, v, layer)
         return cache
 

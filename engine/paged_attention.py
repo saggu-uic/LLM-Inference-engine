@@ -237,19 +237,25 @@ class PagedAttentionEngine:
     @staticmethod
     def _to_legacy(past_key_values) -> tuple:
         """
-        Convert any DynamicCache-compatible object to a tuple-of-(k, v) per layer.
+        Extract per-layer (k, v) tensors from a DynamicCache, across all
+        transformers versions.  Each tensor is shaped (1, heads, seq_len, head_dim).
 
-        DynamicCache's internal attribute names changed in transformers 4.57.6
-        (key_cache / value_cache no longer exist as plain attributes).
-        to_legacy_cache() is the stable public API that works across all versions.
+        The internal storage has changed several times:
+          * >= 4.54 : cache.layers[i].keys / .values   (current — verified 4.57.x)
+          * 4.36-4.53: cache.key_cache[i] / .value_cache[i]  (plain lists)
+          * deprecated public fallback: to_legacy_cache()
         """
+        layers = getattr(past_key_values, "layers", None)
+        if layers is not None:
+            return tuple((lyr.keys, lyr.values) for lyr in layers)
+        if hasattr(past_key_values, "key_cache"):
+            return tuple(
+                (past_key_values.key_cache[i], past_key_values.value_cache[i])
+                for i in range(len(past_key_values.key_cache))
+            )
         if hasattr(past_key_values, "to_legacy_cache"):
             return past_key_values.to_legacy_cache()
-        # Older transformers — direct attribute access
-        return tuple(
-            (past_key_values.key_cache[i], past_key_values.value_cache[i])
-            for i in range(len(past_key_values.key_cache))
-        )
+        raise RuntimeError(f"Unsupported KV cache layout: {type(past_key_values)}")
 
     def _store_kv(
         self,
@@ -270,20 +276,16 @@ class PagedAttentionEngine:
                 self.pool.write(phys_block, slot, layer, k[0, :, pos, :], v[0, :, pos, :])
 
     def _build_past_kv(self, seq_id: int, seq_len: int) -> DynamicCache:
-        """Reconstruct a DynamicCache by gathering KV from the paged pool."""
+        """Reconstruct a DynamicCache by gathering KV from the paged pool.
+
+        update(k, v, layer_idx) is the one Cache API that has been stable across
+        every transformers version — it lazily appends a layer when needed, so a
+        fresh empty DynamicCache fills up correctly regardless of internal storage.
+        """
         block_table = self.allocator.block_table(seq_id)
-        # Build as legacy tuple-of-(k, v) pairs then convert via the stable classmethod.
-        # from_legacy_cache calls update() internally, which is the correct public API
-        # regardless of what internal storage DynamicCache uses in this version.
-        legacy = tuple(
-            self.pool.gather(block_table, seq_len, layer)
-            for layer in range(self.num_layers)
-        )
-        if hasattr(DynamicCache, "from_legacy_cache"):
-            return DynamicCache.from_legacy_cache(legacy)
-        # Fallback: populate via update() directly
         cache = DynamicCache()
-        for layer, (k, v) in enumerate(legacy):
+        for layer in range(self.num_layers):
+            k, v = self.pool.gather(block_table, seq_len, layer)
             cache.update(k, v, layer)
         return cache
 
